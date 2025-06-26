@@ -1,0 +1,137 @@
+- name: Setup Spigot Minecraft Server on Raspberry Pi 3
+  hosts: raspberrypi
+  become: true
+
+  vars:
+    mc_dir: /home/yuvac/minecraft
+    buildtools_dir: /home/yuvac/buildtools
+    xms_mem: 256M
+    xmx_mem: 700M
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - wget
+          - curl
+          - tar
+        update_cache: yes
+
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: yuvac
+        mode: '0755'
+      loop:
+        - "{{ mc_dir }}"
+        - "{{ buildtools_dir }}"
+
+    - name: Download Microsoft OpenJDK 17 for ARM64
+      get_url:
+        url: https://aka.ms/download-jdk/microsoft-jdk-17.0.11-linux-aarch64.tar.gz
+        dest: /tmp/microsoft-jdk-17.tar.gz
+        mode: '0644'
+
+    - name: Extract Microsoft OpenJDK 17 to /opt
+      ansible.builtin.shell: |
+        mkdir -p /opt/microsoft-jdk-17
+        tar -xzf /tmp/microsoft-jdk-17.tar.gz -C /opt/microsoft-jdk-17 --strip-components=1
+      args:
+        executable: /bin/bash
+
+    - name: Find Microsoft JDK 17 folder
+      shell: ls -d /opt/microsoft-jdk-17*/ | head -n 1
+      register: jdk17_folder
+      changed_when: false
+
+    - name: Debug JDK 17 path
+      debug:
+        msg: "JDK path is {{ jdk17_folder.stdout }}"
+
+    - name: Create symlink /opt/jdk17 pointing to JDK directory
+      file:
+        src: /opt/microsoft-jdk-17
+        dest: /opt/jdk17
+        state: link
+
+    - name: Set Java 17 as default (from Microsoft JDK)
+      shell: |
+        update-alternatives --install /usr/bin/java java /opt/jdk17/bin/java 1
+        update-alternatives --install /usr/bin/javac javac /opt/jdk17/bin/javac 1
+        update-alternatives --set java /opt/jdk17/bin/java
+        update-alternatives --set javac /opt/jdk17/bin/javac
+      become: true
+
+    - name: Download BuildTools
+      get_url:
+        url: https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar
+        dest: "{{ buildtools_dir }}/BuildTools.jar"
+        mode: '0755'
+        owner: yuvac
+
+    - name: Build Spigot (may take 20–30 minutes)
+      become: false
+      shell: |
+        cd {{ buildtools_dir }}
+        java -Xmx1536M -jar BuildTools.jar --rev 1.19.4
+      args:
+        chdir: "{{ buildtools_dir }}"
+      environment:
+        HOME: "/home/yuvac"
+
+    - name: Copy spigot jar to server directory
+      copy:
+        src: "{{ buildtools_dir }}/spigot-1.19.4.jar"
+        dest: "{{ mc_dir }}/spigot.jar"
+        remote_src: yes
+      become: false
+
+    - name: Accept EULA
+      copy:
+        dest: "{{ mc_dir }}/eula.txt"
+        content: "eula=true\n"
+        owner: yuvac
+        mode: '0644'
+
+    - name: Create start script
+      copy:
+        dest: "{{ mc_dir }}/start.sh"
+        content: |
+          #!/bin/bash
+          java -Xms{{ xms_mem }} -Xmx{{ xmx_mem }} -jar spigot.jar nogui
+        owner: yuvac
+        mode: '0755'
+
+    - name: Create systemd service for Minecraft server
+      copy:
+        dest: /etc/systemd/system/minecraft.service
+        content: |
+          [Unit]
+          Description=Minecraft Server
+          After=network.target
+
+          [Service]
+          User=yuvac
+          WorkingDirectory={{ mc_dir }}
+          ExecStart=/usr/bin/java -Xms{{ xms_mem }} -Xmx{{ xmx_mem }} -jar {{ mc_dir }}/spigot.jar nogui
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd to register the new service
+      shell: systemctl daemon-reexec && systemctl daemon-reload
+
+    - name: Enable Minecraft service to start on boot
+      systemd:
+        name: minecraft
+        enabled: yes
+
+    - name: Start Minecraft server
+      systemd:
+        name: minecraft
+        state: started
+
